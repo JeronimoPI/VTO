@@ -108,10 +108,34 @@ VTO_TEST_RTSP_URL=rtsp://127.0.0.1:8554/test .venv/bin/python -m unittest discov
 
 ### Wat is daadwerkelijk gecontroleerd?
 
-- De actuele Linux-testsuite: zeven geslaagde tests, twee expliciet overgeslagen integratietests voor NDI en een externe RTSP-bron.
+- De actuele Linux-testsuite: dertien geslaagde tests, twee expliciet overgeslagen integratietests voor NDI en een externe RTSP-bron.
 - De desktop-smoketest als Python-broncode: templates, statische bestanden, NDI-binding laden, echte JPEG-frames en opruimen slagen.
 - Chromium in de eerste versie: videobeeld, stoppen, toevoegen, foutmeldingen en mobiele layout. Het native Mac/Windows-venster is nog niet getest.
 - RTSP-ontvangst is in de eerste versie getest met een tijdelijke MediaMTX-server en een H.264-testzender. De herwerkte platformonafhankelijke pipe-reader wordt door de huidige HTTP/HLS- en testbeeldtests gecontroleerd; RTSP moet daarmee nog opnieuw worden getest.
+- De NDI-ontvanger gebruikt nu FrameSync zoals het cyndilib-viewervoorbeeld, met RGBX/RGBA-ontvangst en 15 fps preview. Regressietests controleren rijpadding, metadata vóór het vrijgeven van native frames, JPEG-uitvoer en aparte foutcodes voor verbindings- en videotimeouts. Dit zijn gesimuleerde ontvangstsituaties, geen bewijs van ontvangst op een Mac.
 - De eerdere NDI-test met `ndi-python` vond in deze cloudcontainer geen eigen testzender. Avahi en systeem-D-Bus ontbreken. De nieuwe `cyndilib`-binding laadt, maar daadwerkelijke NDI-discovery en ontvangst op jouw LAN blijven te verifiëren.
 
 NDI® is een geregistreerd merk van Vizrt NDI AB; zie https://ndi.video. De gebundelde runtime en afhankelijkheden hebben hun eigen licenties. De bouwconfiguratie neemt de bijgeleverde runtime- en licentiebestanden mee; raadpleeg de NDI-distributievoorwaarden bij het voorbereiden van een release.
+
+## NDI-bron zichtbaar, maar geen beeld
+
+De app maakt nu onderscheid tussen:
+
+- `NDI_CONNECT_TIMEOUT`: de bron is ontdekt, maar de videoverbinding is na 15 seconden niet actief.
+- `NDI_VIDEO_TIMEOUT`: de verbinding is actief, maar er wordt geen videoframe aangeleverd.
+- `NDI_PIXEL_FORMAT`, `NDI_FRAME_LAYOUT`, `NDI_FRAME_SIZE`: de ontvangen beeldgegevens kunnen niet veilig worden omgezet.
+- `NDI_RECEIVE_ERROR`: een onverwachte fout, met de fase en het exceptiontype in de melding. Willekeurige exceptiontekst wordt niet getoond of gelogd.
+
+Voor een test zonder desktopvenster: sluit VTO en laat de NDI-zender aanstaan. Voer in de projectmap uit:
+
+```sh
+.venv/bin/python scripts/diagnose_ndi.py
+```
+
+Bij meerdere bronnen kun je selecteren op een deel van de naam:
+
+```sh
+.venv/bin/python scripts/diagnose_ndi.py --source "Test Patterns"
+```
+
+De uitvoer toont de runtimeversie, het aantal actieve NDI-verbindingen, de ontvangstfase en of meerdere previewframes daadwerkelijk zijn ontvangen. Deel die uitvoer wanneer de feed nog geen beeld geeft. Het programma wijzigt geen netwerkinstellingen.

@@ -14,11 +14,12 @@ import cv2
 import numpy as np
 from flask import Flask, Response, abort, jsonify, render_template, request
 from media_runtime import ffmpeg_path, trusted_ca_file
+from ndi_video import NDIReceiveError, read_bgr
 
 try:
     from cyndilib.finder import Finder
-    from cyndilib.receiver import Receiver, ReceiveFrameType
-    from cyndilib.video_frame import VideoRecvFrame
+    from cyndilib.receiver import Receiver
+    from cyndilib.video_frame import VideoFrameSync
     from cyndilib.wrapper.ndi_recv import RecvBandwidth, RecvColorFormat
     NDI_READY = True
 except (ImportError, OSError, RuntimeError):
@@ -120,6 +121,9 @@ class Preview:
         self.message = 'Verbinding maken met de bron…'
         self.width = self.height = 0
         self.last_frame = time.monotonic()
+        self.error_code = None
+        self.ndi_stage = 'initialiseren'
+        self.ndi_connections = 0
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
 
@@ -138,10 +142,20 @@ class Preview:
                 self.receive_ndi()
             else:
                 self.receive_ffmpeg()
-        except Exception:
-            app.logger.warning('Preview failed for source %s', self.source['id'])
+        except Exception as exc:
             self.state = 'error'
-            self.message = 'Geen beeld ontvangen. Controleer het adres, de toegangsgegevens en de netwerkverbinding.'
+            if self.source['kind'] == 'NDI':
+                self.error_code = exc.code if isinstance(exc, NDIReceiveError) else 'NDI_RECEIVE_ERROR'
+                if isinstance(exc, NDIReceiveError):
+                    self.message = f'{exc} ({self.error_code})'
+                else:
+                    self.message = f'NDI-ontvangst mislukt tijdens {self.ndi_stage} ({type(exc).__name__}, {self.error_code}).'
+                # Never log arbitrary exception text that could contain URLs.
+                app.logger.warning('NDI preview failed: code=%s stage=%s exception=%s',
+                                   self.error_code, self.ndi_stage, type(exc).__name__)
+            else:
+                app.logger.warning('Preview failed for source %s', self.source['id'])
+                self.message = 'Geen beeld ontvangen. Controleer het adres, de toegangsgegevens en de netwerkverbinding.'
         finally:
             if self.stop.is_set():
                 self.state, self.message = 'stopped', 'Weergave gestopt'
@@ -231,29 +245,42 @@ class Preview:
 
     def receive_ndi(self):
         if not NDI_READY:
-            raise RuntimeError('NDI runtime unavailable')
-        receiver = Receiver(color_format=RecvColorFormat.BGRX_BGRA,
-                            bandwidth=RecvBandwidth.highest, allow_video_fields=False)
-        video = VideoRecvFrame()
-        receiver.set_video_frame(video)
+            raise NDIReceiveError('NDI_RUNTIME', 'De NDI-runtime kon niet worden geladen.')
+        # Follow cyndilib's viewer example: let the NDI FrameSync receiver
+        # produce display frames at the preview cadence, independently of the
+        # sender's cadence (e.g. the user's 1080/50p Test Patterns source).
+        receiver = Receiver(color_format=RecvColorFormat.RGBX_RGBA,
+                            bandwidth=RecvBandwidth.highest, allow_video_fields=False,
+                            recv_name='VTO preview')
         try:
-            receiver.set_source(self.source['ndi_source'])
+            video = VideoFrameSync()
+            receiver.frame_sync.set_video_frame(video)
+            self.ndi_stage = 'verbinden'
+            source = self.source['ndi_source']
+            if not source.valid and not source.update():
+                raise NDIReceiveError('NDI_SOURCE_LOST', 'De NDI-bron is niet meer beschikbaar. Zoek opnieuw.')
+            receiver.set_source(source)
             while not self.stop.is_set():
+                self.ndi_connections = receiver.get_num_connections()
                 if time.monotonic() - self.last_frame > 15:
-                    raise TimeoutError('No NDI video')
-                kind = receiver.receive(ReceiveFrameType.recv_video, 500)
-                if kind & ReceiveFrameType.recv_video:
-                    # Copy and release the native view before the next receive.
-                    raw = np.frombuffer(video, dtype=np.uint8).copy()
-                    pixels = raw.reshape(video.yres, -1)[:, :video.xres * 4]
-                    frame = cv2.cvtColor(pixels.reshape(video.yres, video.xres, 4), cv2.COLOR_BGRA2BGR)
+                    if not self.ndi_connections:
+                        raise NDIReceiveError('NDI_CONNECT_TIMEOUT', 'NDI-bron gevonden, maar de videoverbinding komt niet tot stand binnen 15 seconden.')
+                    raise NDIReceiveError('NDI_VIDEO_TIMEOUT', 'De NDI-verbinding is actief, maar de bron levert binnen 15 seconden geen videoframe.')
+                if not self.ndi_connections:
+                    self.ndi_stage = 'verbinden'
+                    self.stop.wait(.1)
+                    continue
+                self.ndi_stage = 'beeld ontvangen'
+                receiver.frame_sync.capture_video()
+                self.ndi_stage = 'beeld omzetten'
+                frame = read_bgr(video)
+                if frame is not None:
                     if frame.shape[1] > 1280:
                         frame = cv2.resize(frame, (1280, round(frame.shape[0] * 1280 / frame.shape[1])))
                     ok, encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
                     if ok:
                         self.publish(encoded.tobytes(), frame.shape[1], frame.shape[0])
-                elif kind & ReceiveFrameType.recv_error:
-                    raise RuntimeError('NDI connection failed')
+                self.stop.wait(1 / 15)
         finally:
             receiver.disconnect()
 
@@ -264,9 +291,12 @@ class Preview:
         self.thread.join(timeout=3)
 
     def status(self):
+        extra = dict(error_code=self.error_code)
+        if self.source['kind'] == 'NDI':
+            extra['ndi'] = dict(stage=self.ndi_stage, connections=self.ndi_connections)
         if self.state == 'live' and time.monotonic() - self.last_frame > 3:
-            return dict(state='buffering', message='Wachten op nieuw beeld…', width=self.width, height=self.height)
-        return dict(state=self.state, message=self.message, width=self.width, height=self.height)
+            return dict(state='buffering', message='Wachten op nieuw beeld…', width=self.width, height=self.height, **extra)
+        return dict(state=self.state, message=self.message, width=self.width, height=self.height, **extra)
 
     def frames(self):
         sequence = -1
