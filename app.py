@@ -15,6 +15,7 @@ import numpy as np
 from flask import Flask, Response, abort, jsonify, render_template, request
 from media_runtime import ffmpeg_path, trusted_ca_file
 from ndi_video import NDIReceiveError, read_bgr
+from recording import ClipRecorder, RecordingError
 
 try:
     from cyndilib.finder import Finder
@@ -35,6 +36,7 @@ finder = None
 current = None
 mdns = None
 browser = None
+recordings = ClipRecorder()
 
 
 def public(source):
@@ -124,17 +126,20 @@ class Preview:
         self.error_code = None
         self.ndi_stage = 'initialiseren'
         self.ndi_connections = 0
+        recordings.select_source(self.id, self.source['name'])
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
 
     def publish(self, jpeg, width, height):
+        timestamp = time.monotonic()
         with self.condition:
             self.frame = jpeg
             self.sequence += 1
             self.width, self.height = width, height
-            self.last_frame = time.monotonic()
+            self.last_frame = timestamp
             self.state, self.message = 'live', 'Beeld wordt ontvangen'
             self.condition.notify_all()
+        recordings.push(self.id, jpeg, width, height, timestamp)
 
     def run(self):
         try:
@@ -289,6 +294,7 @@ class Preview:
         with self.condition:
             self.condition.notify_all()
         self.thread.join(timeout=3)
+        recordings.stop_source(self.id)
 
     def status(self):
         extra = dict(error_code=self.error_code)
@@ -384,6 +390,8 @@ def start_preview():
     if source is None:
         return jsonify(error='Deze bron is niet meer beschikbaar. Zoek opnieuw.'), 404
     with control_lock:
+        if recordings.is_collecting():
+            raise RecordingError('De clip wordt opgenomen. Wacht met het wisselen van bron.')
         if current:
             current.close()
         current = Preview(source)
@@ -408,7 +416,38 @@ def preview_video(preview_id):
 def stop_preview(preview_id):
     with control_lock:
         if current and current.id == preview_id:
+            if recordings.is_collecting():
+                raise RecordingError('De clip wordt opgenomen. Wacht met het stoppen van de bron.')
             current.close()
+    return '', 204
+
+
+@app.errorhandler(RecordingError)
+def recording_error(error):
+    return jsonify(error=str(error)), 409
+
+
+@app.post('/api/preview/<preview_id>/recordings')
+def record_clip(preview_id):
+    with control_lock:
+        if not current or current.id != preview_id:
+            abort(404)
+        if current.state != 'live':
+            raise RecordingError('Wacht op live beeld voordat je een clip maakt.')
+        return jsonify(recordings.trigger(preview_id)), 202
+
+
+@app.get('/api/recordings')
+def recording_status():
+    return jsonify(recordings.status())
+
+
+@app.post('/api/recordings/open-folder')
+def open_recording_folder():
+    try:
+        recordings.open_directory()
+    except (OSError, subprocess.SubprocessError):
+        return jsonify(error='De opnamemap kon niet worden geopend.'), 409
     return '', 204
 
 
@@ -418,6 +457,7 @@ def cleanup():
         if current:
             current.close()
             current = None
+    recordings.shutdown()
     if browser:
         browser.cancel()
         browser = None

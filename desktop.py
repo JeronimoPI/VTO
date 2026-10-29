@@ -6,6 +6,53 @@ import threading
 from werkzeug.serving import make_server
 
 import app as backend
+from recording import RecordingError
+
+
+class DesktopAPI:
+    def __init__(self):
+        self._window = None
+        self._picker_lock = threading.Lock()
+
+    def choose_recording_folder(self):
+        import webview
+
+        with self._picker_lock:
+            if backend.recordings.is_busy():
+                return dict(error='Wacht tot de huidige clip is opgeslagen.')
+            folder = backend.recordings.directory
+            try:
+                selected = self._window.create_file_dialog(webview.FileDialog.FOLDER,
+                    directory=str(folder if folder.is_dir() else folder.parent), allow_multiple=False)
+                if not selected:
+                    return dict(cancelled=True)
+                return dict(folder=backend.recordings.set_directory(selected[0]))
+            except (OSError, RecordingError):
+                return dict(error='Deze map kon niet worden gekozen of onthouden. Controleer de schrijfrechten.')
+
+
+def recording_close_guard(window):
+    allowed = threading.Event()
+    prompting = threading.Lock()
+
+    def on_closing():
+        if allowed.is_set() or not backend.recordings.is_busy():
+            return True
+        # Closing callbacks run on the GUI thread on macOS. Its native dialog
+        # marshals back to that thread, so never wait for it in this callback.
+        if prompting.acquire(blocking=False):
+            def confirm():
+                try:
+                    if window.create_confirmation_dialog('Opname nog niet opgeslagen',
+                            'Er wordt nog een clip gemaakt. Wil je VTO afsluiten en deze opname afbreken?'):
+                        allowed.set()
+                        window.destroy()
+                finally:
+                    prompting.release()
+            threading.Thread(target=confirm, daemon=True).start()
+        return False
+
+    return on_closing
 
 
 class DesktopServer:
@@ -36,8 +83,12 @@ def main():
     server = DesktopServer()
     try:
         server.start()
-        webview.create_window('VTO — Stream monitor', server.url, width=1320, height=900,
-                              min_size=(840, 640), background_color='#101214')
+        api = DesktopAPI()
+        window = webview.create_window('VTO — Stream monitor', server.url, width=1320, height=960,
+                              min_size=(840, 640), background_color='#101214', js_api=api)
+        api._window = window
+
+        window.events.closing += recording_close_guard(window)
         # pywebview uses WKWebView on macOS and WebView2 on Windows.
         # The GUI event loop must stay on the main thread.
         webview.start(debug=False)

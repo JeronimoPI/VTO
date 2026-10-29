@@ -61,11 +61,28 @@ Een handmatig te starten GitHub Actions-workflow in `.github/workflows/desktop.y
 - **Stream toevoegen** accepteert een RTSP/RTSPS- of HTTP/HTTPS-adres, bijvoorbeeld `rtsp://192.168.1.20:554/stream` of `http://192.168.1.20/live.m3u8`. Een gewone webpagina met een videospeler is geen streamadres.
 - RTSP-bronnen die `_rtsp._tcp` via mDNS aankondigen worden ook automatisch gevonden. Er wordt geen volledige netwerkscan uitgevoerd. Andere camera's voeg je met hun streamadres toe.
 - **Test de weergave** start een duidelijk gemarkeerd, intern gegenereerd bewegend testbeeld.
-- De preview toont alleen beeld, zonder audio of opname, maximaal 1280 pixels breed. RTSP/HTTP wordt op 15 fps weergegeven. HLS kan merkbare buffering hebben.
+- De preview toont alleen beeld, zonder audio, maximaal 1280 pixels breed. Je kunt nu clips van het getoonde beeld opnemen. RTSP/HTTP wordt op 15 fps weergegeven. HLS kan merkbare buffering hebben.
 - Eén actieve ontvanger voor de app. Bronwisselen stopt de vorige ontvanger. Sluiten van het desktopvenster stopt de ontvanger, de lokale server en netwerkdetectie.
 - Handmatige adressen staan alleen in het geheugen en verdwijnen na afsluiten. Toegangsgegevens in streamadressen worden niet naar de bronlijst teruggestuurd of gelogd.
 
 De desktopapp start intern een server op een vrije loopbackpoort en toont de interface in WKWebView op macOS of WebView2 op Windows. De interface wordt lokaal meegeleverd; een externe website is niet nodig. De videocode leest subprocess-pipes zonder de Unix-specifieke `select()`-aanpak, zodat de ontvangst ook op Windows kan werken.
+
+## Clips opnemen: 3 seconden terug, 7 seconden vooruit
+
+1. Start een bron en laat minstens 3 seconden ononderbroken beeld binnenkomen. De bufferindicator laat zien wanneer opnemen mogelijk is.
+2. Klik in de desktopapp op **Opnamemap kiezen**. Je krijgt de gewone macOS-/Windows-mapkiezer. De gekozen map wordt gecontroleerd op schrijfrechten en voor volgende sessies onthouden. Annuleren behoudt de bestaande map.
+3. Klik op **Neem 10 seconden op**. VTO neemt de 3 seconden vóór ontvangst van het commando mee, verzamelt daarna nog 7 seconden en schrijft automatisch één MP4-bestand.
+4. Wacht tot **Opgeslagen · 10 s** verschijnt. **Map openen** opent de ingestelde map in Finder of Verkenner.
+
+De clips bevatten het **getoonde beeld**, maximaal 1280 pixels breed, H.264/MP4 op 15 fps, zonder audio. Ze gebruiken de ontvangsttijd op deze computer; bij bijvoorbeeld HLS met buffering ligt die later dan de oorspronkelijke gebeurtenis. Binnenkomende frames worden op tijdstempels bemonsterd naar exact 150 frames voor 10 seconden video. Bij kleine timingverschillen kan een frame herhaald worden. Er wordt niet op aantallen binnengekomen frames teruggeteld.
+
+Tijdens het verzamelen van de resterende 7 seconden kun je geen bron wisselen of stoppen. Er wordt één clip tegelijk gemaakt. Bij bronverlies langer dan 0,75 seconde of een resolutiewijziging wordt de clip afgebroken met een melding. Onvolledige clips worden niet als geslaagde MP4 bewaard. De beeldbuffer vult zich daarna opnieuw. Sluiten tijdens verzamelen of opslaan vraagt in de desktopapp of je de nog niet opgeslagen clip wilt afbreken.
+
+Zonder eigen keuze is de opnamemap op macOS `~/Movies/VTO` en op Windows `~/Videos/VTO`. De mapkeuze staat op macOS in `~/Library/Application Support/VTO/settings.json`, op Windows onder `%LOCALAPPDATA%/VTO/settings.json` en op Linux onder `$XDG_CONFIG_HOME/vto/settings.json` (of `~/.config/vto/settings.json`). `VTO_RECORDINGS_DIR` kan voor ontwikkeling een tijdelijke map afdwingen; voor normaal gebruik is die variabele niet nodig. De native mapkiezer is alleen in het desktopvenster beschikbaar.
+
+Tijdelijke encoderbestanden worden in de gekozen map gemaakt en na succes atomisch naar de definitieve bestandsnaam hernoemd. Filenamen bevatten tijd, bronnaam en een unieke identificatie; bestaande clips worden niet overschreven. De bronbuffer is begrensd tot 64 MiB en het verzamelde clipbeeld tot 192 MiB. Overschrijding stopt de opname of schakelt de opnameknop tijdelijk uit in plaats van onbeperkt geheugen te gebruiken.
+
+De automatische opname-test encodeert en decodeert een echte MP4: exact 10 seconden, 150 frames, met 45 frames van vóór de klik en 105 frames van erna. Browsercontrole met een bewegend testbeeld bevestigde automatisch verzamelen, opslaan, statusmeldingen en een werkende volgende opname. Mapkeuze en afsluitbevestiging zijn met een gesimuleerd native venster getest; de echte macOS-dialogen moeten nog op de Mac worden gecontroleerd. De gebruiker heeft de NDI-weergave van de voorafgaande versie op de Mac bevestigd.
 
 ## NDI en jouw netwerk
 
@@ -108,7 +125,7 @@ VTO_TEST_RTSP_URL=rtsp://127.0.0.1:8554/test .venv/bin/python -m unittest discov
 
 ### Wat is daadwerkelijk gecontroleerd?
 
-- De actuele Linux-testsuite: dertien geslaagde tests, twee expliciet overgeslagen integratietests voor NDI en een externe RTSP-bron.
+- De actuele Linux-testsuite: tweeëntwintig geslaagde tests, twee expliciet overgeslagen integratietests voor NDI en een externe RTSP-bron.
 - De desktop-smoketest als Python-broncode: templates, statische bestanden, NDI-binding laden, echte JPEG-frames en opruimen slagen.
 - Chromium in de eerste versie: videobeeld, stoppen, toevoegen, foutmeldingen en mobiele layout. Het native Mac/Windows-venster is nog niet getest.
 - RTSP-ontvangst is in de eerste versie getest met een tijdelijke MediaMTX-server en een H.264-testzender. De herwerkte platformonafhankelijke pipe-reader wordt door de huidige HTTP/HLS- en testbeeldtests gecontroleerd; RTSP moet daarmee nog opnieuw worden getest.
