@@ -104,6 +104,9 @@ def smoke_test():
 
     if not backend.NDI_READY:
         raise RuntimeError('The bundled NDI binding could not be loaded')
+    from ndi_capture import NativeReceiver
+    probe = NativeReceiver('')
+    probe.close()
     server = DesktopServer()
     try:
         server.start()

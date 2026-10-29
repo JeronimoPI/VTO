@@ -53,13 +53,17 @@ class NDIFrameTests(unittest.TestCase):
 class NDIReceiverTests(unittest.TestCase):
     source = dict(id='ndi-regression', name='Local test source', kind='NDI', ndi_source=SimpleNamespace(valid=True))
 
-    def test_framesync_video_reaches_jpeg_preview_and_disconnects(self):
+    def test_native_video_reaches_jpeg_preview_and_closes(self):
         receiver = Mock()
         receiver.get_num_connections.return_value = 1
         video = PaddedFrame()
         # Each capture delivers new owned frame storage and valid metadata.
-        receiver.frame_sync.capture_video.side_effect = lambda: video.__init__()
-        with patch.object(app, 'NDI_READY', True), patch.object(app, 'Receiver', return_value=receiver), patch.object(app, 'VideoFrameSync', return_value=video):
+        def capture(_timeout):
+            time.sleep(.01)
+            video.__init__()
+            return video
+        receiver.capture_video.side_effect = capture
+        with patch.object(app, 'NDI_READY', True), patch.object(app, 'NativeReceiver', return_value=receiver):
             preview = app.Preview(self.source)
             try:
                 deadline = time.monotonic() + 3
@@ -73,8 +77,8 @@ class NDIReceiverTests(unittest.TestCase):
                 self.assertEqual(preview.status()['ndi']['connections'], 1)
             finally:
                 preview.close()
-            receiver.frame_sync.set_video_frame.assert_called_once_with(video)
-            receiver.disconnect.assert_called_once()
+            self.assertTrue(receiver.free_video.called)
+            receiver.close.assert_called_once()
             self.assertFalse(preview.thread.is_alive())
 
     def test_connection_timeout_differs_from_video_timeout(self):
@@ -82,7 +86,7 @@ class NDIReceiverTests(unittest.TestCase):
             with self.subTest(connections=connections):
                 receiver = Mock()
                 receiver.get_num_connections.return_value = connections
-                with patch.object(app, 'NDI_READY', True), patch.object(app, 'Receiver', return_value=receiver), patch.object(app, 'VideoFrameSync'), patch.object(app, 'time', wraps=time) as clock:
+                with patch.object(app, 'NDI_READY', True), patch.object(app, 'NativeReceiver', return_value=receiver), patch.object(app, 'time', wraps=time) as clock:
                     clock.monotonic.side_effect = [0, 16]
                     preview = app.Preview(self.source)
                     try:
@@ -93,10 +97,10 @@ class NDIReceiverTests(unittest.TestCase):
                         self.assertEqual(preview.status()['ndi']['connections'], connections)
                     finally:
                         preview.close()
-                receiver.disconnect.assert_called_once()
+                receiver.close.assert_called_once()
 
     def test_unexpected_error_does_not_expose_arbitrary_exception_text(self):
-        with patch.object(app, 'NDI_READY', True), patch.object(app, 'Receiver', side_effect=RuntimeError('rtsp://user:password@private-host/stream')):
+        with patch.object(app, 'NDI_READY', True), patch.object(app, 'NativeReceiver', side_effect=RuntimeError('rtsp://user:password@private-host/stream')):
             preview = app.Preview(self.source)
             preview.thread.join(timeout=2)
             self.assertEqual(preview.status()['error_code'], 'NDI_RECEIVE_ERROR')

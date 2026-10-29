@@ -49,16 +49,16 @@ function showStatus(state, message) {
   $('connection-message').textContent = message;
 }
 async function connect(source) {
-  if (collectingClip()) { toast('Wacht tot de huidige opname klaar is voordat je van bron wisselt.'); return; }
+  if (recordingState?.active) { toast('Wacht tot de huidige clip is opgeslagen voordat je van bron of beeldstand wisselt.'); return; }
   if (connect.busy) return;
   connect.busy = true;
   const token = ++generation;
   clearTimeout(poll); selected = source; preview = null; renderSources();
   $('video').removeAttribute('src'); $('video').hidden = true; $('placeholder').hidden = true;
   $('viewer-name').textContent = source.name; $('detail-type').textContent = source.kind; $('detail-address').textContent = source.address; $('detail-resolution').textContent = '—';
-  $('stop').disabled = false; showStatus('connecting', 'Verbinding maken met de bron…');
+  clearSignal(); $('stop').disabled = false; showStatus('connecting', 'Verbinding maken met de bron…');
   try {
-    const data = await api('/api/preview', {method:'POST', body:JSON.stringify({source_id:source.id})});
+    const data = await api('/api/preview', {method:'POST', body:JSON.stringify({source_id:source.id, quality:$('quality').value})});
     if (token !== generation) { await api(`/api/preview/${data.id}`, {method:'DELETE'}); return; }
     preview = data.id; $('video').src = `/api/preview/${preview}/video`;
     async function status() {
@@ -67,6 +67,7 @@ async function connect(source) {
         const state = await api(`/api/preview/${data.id}`);
         if (token !== generation) return;
         showStatus(state.state, state.message);
+        renderSignal(state);
         $('video').hidden = !['live','buffering'].includes(state.state);
         if (state.width) $('detail-resolution').textContent = `${state.width} × ${state.height}`;
         if (!['error','stopped'].includes(state.state)) poll = setTimeout(status, 700);
@@ -113,16 +114,18 @@ function updateRecordingControls() {
   const buffer = recordingState?.buffer;
   const ready = preview && buffer?.source_id === preview && buffer.ready && viewerState === 'live';
   $('record').disabled = !recordingReachable || !ready || !!active || recordingRequest || folderRequest;
-  $('record').innerHTML = active?.state === 'collecting' ? '<span aria-hidden="true">●</span> Opname loopt…' : active?.state === 'saving' ? 'MP4 opslaan…' : '<span aria-hidden="true">●</span> Neem 10 seconden op';
+  $('record').innerHTML = active?.state === 'collecting' ? `<span aria-hidden="true">●</span> Opname · ${active.remaining} s` : active?.state === 'saving' ? 'MP4 opslaan…' : '<span aria-hidden="true">●</span> Neem 10 seconden op';
   $('buffer-progress').value = buffer?.source_id === preview ? buffer.seconds : 0;
   let message = 'Selecteer een bron om de beeldbuffer te vullen.';
   if (active?.state === 'collecting') message = `Opname loopt · nog ${active.remaining} seconden. Laat de bron actief.`;
   else if (active?.state === 'saving') message = 'MP4 opslaan… Laat VTO open tot de clip klaar is.';
   else if (ready) message = 'Klaar · 3 seconden vóór de klik worden meegenomen.';
+  else if (preview && buffer?.error) message = buffer.error;
   else if (preview && viewerState === 'live') message = `Beeldbuffer vullen… ${Math.min(3, buffer?.seconds || 0).toFixed(1)} / 3 seconden`;
   else if (preview) message = 'Wachten op ononderbroken live beeld…';
   $('record-status').textContent = message;
   const nativePicker = typeof window.pywebview?.api?.choose_recording_folder === 'function';
+  $('quality').disabled = !!active || connect.busy;
   $('choose-folder').disabled = !nativePicker || !!active || folderRequest;
   $('choose-folder').title = nativePicker ? 'Kies waar clips worden bewaard' : 'Map kiezen is beschikbaar in de desktopapp';
   if (recordingState) $('recording-folder').textContent = recordingState.folder;
@@ -135,7 +138,7 @@ function renderRecordings() {
     const name = document.createElement('span'); name.textContent = clip.filename;
     const state = document.createElement('span');
     state.className = clip.state === 'saved' ? 'clip-saved' : clip.state === 'error' ? 'clip-error' : 'clip-pending';
-    state.textContent = clip.state === 'saved' ? '✓ Opgeslagen · 10 s' : clip.state === 'collecting' ? `${clip.remaining} s resterend` : clip.message;
+    state.textContent = clip.state === 'saved' ? `✓ Opgeslagen · ${clip.fps || 15} fps` : clip.state === 'collecting' ? `${clip.remaining} s resterend` : clip.message;
     row.append(name, state); list.append(row);
   }
 }
@@ -175,3 +178,38 @@ $('open-folder').addEventListener('click', async () => {
 window.addEventListener('pywebviewready', updateRecordingControls);
 async function pollRecordings() { await refreshRecordings(); setTimeout(pollRecordings, 500); }
 pollRecordings();
+
+
+function clearSignal() {
+  for (const id of ['signal-format','signal-pixels','signal-received','signal-dropped','signal-input-fps','signal-preview-fps','signal-scan']) $(id).textContent = '—';
+  $('signal-health').textContent = 'WACHTEN OP SIGNAAL'; $('signal-health').className = 'badge';
+  $('signal-loss-detail').textContent = 'Nog geen SDK-meting';
+}
+function fmtFps(value) { return Number.isFinite(value) ? `${value.toLocaleString('nl-NL', {maximumFractionDigits: 3})} fps` : '—'; }
+function renderSignal(status) {
+  const signal = status.signal || {}, input = signal.input, sdk = signal.sdk || {}, profile = status.quality;
+  const ndi = selected?.kind === 'NDI';
+  $('signal-format').textContent = input ? `${input.width} × ${input.height} · ${fmtFps(input.fps)}` : 'Nog niet beschikbaar';
+  $('signal-scan').textContent = input?.scan ? `Decoder: ${input.scan}` : 'Bronformaat niet gemeten';
+  $('signal-pixels').textContent = input?.pixel_format || 'Niet beschikbaar';
+  $('signal-received').textContent = ndi && sdk.available ? sdk.received.toLocaleString('nl-NL') : ndi ? 'Niet beschikbaar' : 'Niet van toepassing';
+  $('signal-dropped').textContent = ndi && sdk.available ? sdk.dropped.toLocaleString('nl-NL') : ndi ? 'Niet beschikbaar' : 'Niet van toepassing';
+  $('signal-input-fps').textContent = ndi && sdk.available ? fmtFps(sdk.fps) : '—';
+  $('signal-preview-fps').textContent = fmtFps(signal.processing_fps);
+  $('signal-loss-detail').textContent = !ndi ? 'Alleen beschikbaar voor NDI' : !sdk.available ? 'Geen actuele SDK-meting' : `${Number.isFinite(sdk.dropped_percent) ? sdk.dropped_percent.toLocaleString('nl-NL', {maximumFractionDigits:3}) + '% van SDK-totaal · ' : ''}${sdk.recent_drops ?? '—'} nieuw sinds vorige meting`;
+  let health = 'GEEN ACTUEEL BEELD', healthClass = 'badge';
+  if (status.state === 'live') {
+    if (!ndi) health = 'GEEN NDI-VERLIESMETING';
+    else if (!sdk.available) health = 'SDK-METING ONTBREEKT';
+    else if (sdk.recent_drops > 0) { health = 'NIEUWE FRAMEVERLIEZEN'; healthClass += ' loss'; }
+    else if (sdk.received > 0 && sdk.recent_drops !== null) { health = 'GEEN NIEUW SDK-VERLIES'; healthClass += ' live'; }
+    else health = 'SDK-METING OPSTARTEN';
+  }
+  $('signal-health').textContent = health; $('signal-health').className = healthClass;
+  if (profile) {
+    $('signal-quality-note').textContent = `VTO-voorbeeld: ${status.width || '—'} × ${status.height || '—'}, maximaal ${profile.fps} fps en JPEG-beeld. ${input?.fps > profile.fps || input?.width > status.width || input?.height > status.height ? 'Deze stand verlaagt de voorbeeldresolutie en/of framerate ten opzichte van het ontvangen signaal.' : 'De werkelijke verwerkingssnelheid staat hierboven.'}`;
+  }
+  const buffer = recordingState?.buffer;
+  $('signal-recording-note').textContent = ndi ? input?.fps ? `NDI-opname: ${input.width} × ${input.height} op ${fmtFps(input.fps)}. Alle ontvangen bronframes gaan naar de opnamebuffer; de voorbeeldstand verandert dit niet. Geen kunstmatige 100 fps.` : 'NDI-opnames wachten op de werkelijke bronresolutie en bronframerate.' : `RTSP/HTTP/testbeeld: opname van de VTO-weergave op ${buffer?.fps || profile?.fps || 15} fps.`;
+}
+$('quality').addEventListener('change', () => { if (selected) connect(selected); });

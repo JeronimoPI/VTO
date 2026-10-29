@@ -172,3 +172,51 @@ class RecordingTests(unittest.TestCase):
             self.assertTrue(destroyed.wait(timeout=2))
             self.assertTrue(guard())
         window.create_confirmation_dialog.assert_called_once()
+
+    def test_native_50_60_and_100_fps_are_written_without_preview_resampling(self):
+        for fps in [50, 60, 100]:
+            with self.subTest(fps=fps):
+                self.recorder.select_source('native', 'NDI camera', fps=None, native=True)
+                self.recorder.configure_native('native', fps)
+                for index in range(4 * fps):
+                    stamp = 6 + index / fps
+                    self.recorder.push('native', RED, 64, 36, stamp)
+                clip = self.recorder.trigger('native')
+                for index in range(7 * fps):
+                    stamp = 10 + index / fps
+                    self.recorder.push('native', BLUE, 64, 36, stamp)
+                self.now = 17
+                self.recorder.finish(clip['id'])
+                self.recorder.jobs[clip['id']].worker.join(timeout=15)
+                saved = self.recorder.status()['items'][0]
+                self.assertEqual(saved['state'], 'saved', saved)
+                capture = cv2.VideoCapture(saved['path'])
+                try:
+                    self.assertEqual(capture.get(cv2.CAP_PROP_FPS), fps)
+                    self.assertEqual(capture.get(cv2.CAP_PROP_FRAME_COUNT), fps * 10)
+                    capture.set(cv2.CAP_PROP_POS_FRAMES, 3 * fps - 1)
+                    ok, red = capture.read()
+                    self.assertTrue(ok)
+                    self.assertGreater(red[:,:,2].mean(), 240)
+                    ok, blue = capture.read()
+                    self.assertTrue(ok)
+                    self.assertGreater(blue[:,:,0].mean(), 240)
+                finally:
+                    capture.release()
+                self.now = 10
+
+    def test_missing_native_frames_are_not_filled_with_duplicates(self):
+        self.recorder.select_source('native', 'NDI', fps=None, native=True)
+        self.recorder.configure_native('native', 50)
+        for index in range(200):
+            self.recorder.push('native', RED, 64, 36, 6 + index / 50)
+        clip = self.recorder.trigger('native')
+        for index in range(349):  # One frame short; no interpolation is allowed.
+            self.recorder.push('native', BLUE, 64, 36, 10 + index / 50)
+        self.now = 17
+        self.recorder.finish(clip['id'])
+        self.recorder.jobs[clip['id']].worker.join(timeout=15)
+        result = self.recorder.status()['items'][0]
+        self.assertEqual(result['state'], 'error')
+        self.assertIn('bronframes', result['message'])
+        self.assertFalse(Path(result['path']).exists())

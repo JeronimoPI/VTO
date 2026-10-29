@@ -1,6 +1,7 @@
 """Run on the source's network to test NDI reception without the desktop UI."""
 from pathlib import Path
 import argparse
+import json
 import platform
 import sys
 import time
@@ -39,14 +40,16 @@ def main():
         preview = app.Preview(app.sources[source['id']])
         try:
             previous = None
+            started = time.monotonic()
             while preview.thread.is_alive():
                 status = preview.status()
                 summary = (status['state'], status.get('ndi', {}).get('stage'), status.get('ndi', {}).get('connections'))
                 if summary != previous:
                     print(f'Status: {summary[0]} | fase: {summary[1]} | verbindingen: {summary[2]}', flush=True)
                     previous = summary
-                if preview.sequence >= 2:
+                if preview.sequence >= 2 and time.monotonic() - started >= 2:
                     print(f'Videobeeld ontvangen: {preview.width} x {preview.height}; {preview.sequence} previewframes.', flush=True)
+                    print('Signaal: ' + json.dumps(preview.status()['signal'], ensure_ascii=False), flush=True)
                     return 0
                 time.sleep(.2)
             print(preview.message, flush=True)

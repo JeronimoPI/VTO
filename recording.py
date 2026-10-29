@@ -21,8 +21,8 @@ PRE_SECONDS = 3.0
 POST_SECONDS = 7.0
 FPS = 15
 MAX_GAP = .75
-MAX_BUFFER_BYTES = 64 * 1024 * 1024
-MAX_CLIP_BYTES = 192 * 1024 * 1024
+MAX_BUFFER_BYTES = 256 * 1024 * 1024
+MAX_CLIP_BYTES = 768 * 1024 * 1024
 logger = logging.getLogger(__name__)
 
 
@@ -49,6 +49,8 @@ class Clip:
     trigger: float
     path: Path
     frames: list
+    fps: float = FPS
+    native: bool = False
     state: str = 'collecting'
     message: str = 'Nog 7 seconden beeld verzamelen…'
     size: int = 0
@@ -71,6 +73,9 @@ class ClipRecorder:
         self.resolution = None
         self.active = None
         self.jobs = {}
+        self.fps = FPS
+        self.native = False
+        self.signal_error = None
 
     def _load_directory(self):
         override = os.environ.get('VTO_RECORDINGS_DIR')
@@ -120,12 +125,29 @@ class ClipRecorder:
         with self.lock:
             return self._busy()
 
-    def select_source(self, source_id, name):
+    def select_source(self, source_id, name, fps=FPS, native=False):
         with self.lock:
             if self.is_collecting():
                 raise RecordingError('De clip wordt opgenomen. Wacht met het wisselen van bron.')
             self.source_id, self.source_name = source_id, name
+            self.fps, self.native = fps, native
+            self.signal_error = 'Wachten op de bronframerate.' if native else None
             self._clear_buffer()
+
+    def configure_native(self, source_id, fps):
+        with self.lock:
+            if source_id != self.source_id:
+                return
+            if fps is None or not math.isfinite(fps) or fps <= 0 or fps > 120:
+                if self.is_collecting():
+                    self._fail(self.active, 'Opname afgebroken: de bronframerate is niet meer beschikbaar of wordt niet ondersteund.')
+                self.signal_error = 'Opnemen vereist een bekende bronframerate van maximaal 120 fps.'
+                return
+            if fps != self.fps:
+                if self.is_collecting():
+                    self._fail(self.active, 'Opname afgebroken: de bronframerate veranderde.')
+                self._clear_buffer()
+            self.fps, self.native, self.signal_error = fps, True, None
 
     def _clear_buffer(self):
         self.buffer.clear()
@@ -139,6 +161,14 @@ class ClipRecorder:
             if self.is_collecting():
                 self._fail(self.active, 'Opname afgebroken: de bron is gestopt. Er is geen onvolledige clip bewaard.')
             self.source_id = None
+            self._clear_buffer()
+
+    def discontinuity(self, source_id, message):
+        with self.lock:
+            if source_id != self.source_id:
+                return
+            if self.is_collecting():
+                self._fail(self.active, message)
             self._clear_buffer()
 
     def push(self, source_id, jpeg, width, height, timestamp=None):
@@ -170,8 +200,9 @@ class ClipRecorder:
     def _buffer_status(self, now):
         seconds = min(PRE_SECONDS, max(0, self.buffer[-1][0] - self.buffer[0][0])) if self.buffer else 0
         fresh = bool(self.buffer and now - self.buffer[-1][0] <= MAX_GAP)
-        ready = fresh and bool(self.buffer) and self.buffer[0][0] <= now - PRE_SECONDS
-        return dict(source_id=self.source_id, seconds=round(seconds, 2), ready=bool(ready), fresh=fresh)
+        ready = not self.signal_error and fresh and bool(self.buffer) and self.buffer[0][0] <= now - PRE_SECONDS
+        return dict(source_id=self.source_id, seconds=round(seconds, 2), ready=bool(ready), fresh=fresh,
+                    fps=self.fps, native=self.native, resolution=self.resolution, error=self.signal_error)
 
     def trigger(self, source_id):
         with self.lock:
@@ -189,7 +220,12 @@ class ClipRecorder:
             identifier = uuid.uuid4().hex
             name = re.sub(r'[^A-Za-z0-9_-]+', '-', self.source_name).strip('-')[:40] or 'bron'
             filename = f'VTO-{datetime.now().astimezone():%Y%m%d-%H%M%S}-{name}-{identifier[:8]}.mp4'
-            clip = Clip(identifier, self.source_name, now, self.directory / filename, list(self.buffer))
+            frames = list(self.buffer)
+            # Begin at the last captured frame at/before the requested boundary.
+            first = 0
+            while first + 1 < len(frames) and frames[first + 1][0] <= now - PRE_SECONDS:
+                first += 1
+            clip = Clip(identifier, self.source_name, now, self.directory / filename, frames[first:], fps=self.fps, native=self.native)
             clip.size = sum(len(frame) for _, frame in clip.frames)
             self.active = clip
             self.jobs[identifier] = clip
@@ -230,31 +266,40 @@ class ClipRecorder:
         process = None
         watchdog = None
         try:
+            required = round((PRE_SECONDS + POST_SECONDS) * clip.fps)
+            if clip.native and len(frames) > required + 2:
+                raise RecordingError('Opname niet opgeslagen: het aantal bronframes wijkt af van de gemelde bronframerate.')
+            if clip.native and len(frames) < required:
+                raise RecordingError('Opname niet opgeslagen: er ontbreken bronframes. Er worden geen frames verzonnen om de framerate te halen.')
             with tempfile.NamedTemporaryFile(dir=clip.path.parent, prefix='.VTO-', suffix='.partial.mp4', delete=False) as output:
                 partial = Path(output.name)
             args = [ffmpeg_path(), '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
-                    '-f', 'image2pipe', '-vcodec', 'mjpeg', '-framerate', str(FPS), '-i', 'pipe:0',
+                    '-f', 'image2pipe', '-vcodec', 'mjpeg', '-framerate', str(clip.fps), '-i', 'pipe:0',
                     '-an', '-vf', 'pad=ceil(iw/2)*2:ceil(ih/2)*2', '-c:v', 'libx264',
-                    '-threads', '2', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+                    '-threads', '2', '-preset', 'ultrafast' if clip.fps > 60 else 'veryfast', '-crf', '16' if clip.native else '20', '-pix_fmt', 'yuv420p',
                     '-movflags', '+faststart', str(partial)]
             with tempfile.TemporaryFile() as diagnostics:
                 process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                     stderr=diagnostics, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
                 with self.lock:
                     clip.process = process
-                watchdog = threading.Timer(45, lambda: process.kill() if process.poll() is None else None)
+                watchdog = threading.Timer(120, lambda: process.kill() if process.poll() is None else None)
                 watchdog.daemon = True
                 watchdog.start()
                 start = clip.trigger - PRE_SECONDS
                 index = 0
-                # Exactly 150 output frames / 15 fps = 10 seconds. Sampling uses
-                # capture timestamps, never "the last 45 frames" (jitter changes that).
-                for number in range(round((PRE_SECONDS + POST_SECONDS) * FPS)):
+                # NDI stores each original received frame once, without FrameSync
+                # re-clocking or preview throttling. Other sources retain the
+                # timestamped preview sampling used in the original clip feature.
+                for number in range(required):
                     if clip.stop.is_set():
                         raise RecordingError('Opname geannuleerd.')
-                    target = start + number / FPS
-                    while index + 1 < len(frames) and frames[index + 1][0] <= target:
-                        index += 1
+                    if clip.native:
+                        index = number
+                    else:
+                        target = start + number / clip.fps
+                        while index + 1 < len(frames) and frames[index + 1][0] <= target:
+                            index += 1
                     process.stdin.write(frames[index][1])
                 process.stdin.close()
                 if process.wait(timeout=10) != 0 or partial.stat().st_size == 0:
@@ -267,7 +312,7 @@ class ClipRecorder:
         except Exception as exc:
             logger.warning('Recording failed: %s', type(exc).__name__)
             with self.lock:
-                self._fail(clip, 'Opslaan mislukt. Controleer de opnamemap, vrije schijfruimte en schrijfrechten.')
+                self._fail(clip, str(exc) if isinstance(exc, RecordingError) else 'Opslaan mislukt. Controleer de opnamemap, vrije schijfruimte en schrijfrechten.')
         finally:
             if watchdog:
                 watchdog.cancel()
@@ -284,7 +329,8 @@ class ClipRecorder:
 
     def _clip_status(self, clip, now):
         return dict(id=clip.id, source=clip.source, state=clip.state, message=clip.message,
-                    filename=clip.path.name, path=str(clip.path), duration=10, pre_seconds=3,
+                    filename=clip.path.name, path=str(clip.path), duration=round(round(10 * clip.fps) / clip.fps, 4), pre_seconds=3,
+                    fps=clip.fps, native=clip.native,
                     remaining=max(0, math.ceil(clip.trigger + POST_SECONDS - now)) if clip.state == 'collecting' else 0)
 
     def status(self):

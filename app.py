@@ -16,12 +16,11 @@ from flask import Flask, Response, abort, jsonify, render_template, request
 from media_runtime import ffmpeg_path, trusted_ca_file
 from ndi_video import NDIReceiveError, read_bgr
 from recording import ClipRecorder, RecordingError
+from ndi_capture import NativeReceiver
+from video_stats import QUALITY_PROFILES, VideoStats, ndi_metadata, resize_preview
 
 try:
     from cyndilib.finder import Finder
-    from cyndilib.receiver import Receiver
-    from cyndilib.video_frame import VideoFrameSync
-    from cyndilib.wrapper.ndi_recv import RecvBandwidth, RecvColorFormat
     NDI_READY = True
 except (ImportError, OSError, RuntimeError):
     NDI_READY = False
@@ -112,9 +111,11 @@ def scan():
 
 
 class Preview:
-    def __init__(self, source):
+    def __init__(self, source, quality='balanced'):
         self.id = uuid.uuid4().hex
         self.source = source
+        self.profile = dict(QUALITY_PROFILES[quality])
+        self.metrics = VideoStats()
         self.stop = threading.Event()
         self.condition = threading.Condition()
         self.frame = None
@@ -126,7 +127,7 @@ class Preview:
         self.error_code = None
         self.ndi_stage = 'initialiseren'
         self.ndi_connections = 0
-        recordings.select_source(self.id, self.source['name'])
+        recordings.select_source(self.id, self.source['name'], fps=None if self.source['kind'] == 'NDI' else self.profile['fps'], native=self.source['kind'] == 'NDI')
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
 
@@ -139,7 +140,9 @@ class Preview:
             self.last_frame = timestamp
             self.state, self.message = 'live', 'Beeld wordt ontvangen'
             self.condition.notify_all()
-        recordings.push(self.id, jpeg, width, height, timestamp)
+        if self.source['kind'] != 'NDI':
+            recordings.push(self.id, jpeg, width, height, timestamp)
+        self.metrics.published(timestamp)
 
     def run(self):
         try:
@@ -175,7 +178,9 @@ class Preview:
             raise RuntimeError('FFmpeg is not installed')
         args = [executable, '-hide_banner', '-loglevel', 'error', '-nostdin']
         if self.source['kind'] == 'DEMO':
-            args += ['-re', '-f', 'lavfi', '-i', 'testsrc2=size=1280x720:rate=15']
+            width, height, fps = self.profile['width'], self.profile['height'], self.profile['fps']
+            self.metrics.set_input(dict(width=width, height=height, fps=fps, pixel_format='yuv420p', scan='progressive'))
+            args += ['-re', '-f', 'lavfi', '-i', f'testsrc2=size={width}x{height}:rate={fps}']
         else:
             args += ['-protocol_whitelist', 'http,https,tcp,tls,rtsp,rtp,udp,crypto']
             if self.source['kind'] == 'RTSP':
@@ -188,7 +193,9 @@ class Preview:
                 if ca_file:
                     args += ['-ca_file', ca_file]
             args += ['-i', self.source['url']]
-        args += ['-an', '-vf', "fps=15,scale='min(1280,iw)':-2", '-threads', '2', '-q:v', '5', '-f', 'image2pipe', '-vcodec', 'mjpeg', 'pipe:1']
+        scale = (f"fps={self.profile['fps']},scale=w='min({self.profile['width']},iw)':"
+                 f"h='min({self.profile['height']},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2:flags=area")
+        args += ['-an', '-vf', scale, '-threads', '2', '-q:v', str(self.profile['ffmpeg_quality']), '-f', 'image2pipe', '-vcodec', 'mjpeg', 'pipe:1']
         # Do not log stderr: FFmpeg may include URL credentials in diagnostics.
         process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0,
                                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
@@ -251,43 +258,77 @@ class Preview:
     def receive_ndi(self):
         if not NDI_READY:
             raise NDIReceiveError('NDI_RUNTIME', 'De NDI-runtime kon niet worden geladen.')
-        # Follow cyndilib's viewer example: let the NDI FrameSync receiver
-        # produce display frames at the preview cadence, independently of the
-        # sender's cadence (e.g. the user's 1080/50p Test Patterns source).
-        receiver = Receiver(color_format=RecvColorFormat.RGBX_RGBA,
-                            bandwidth=RecvBandwidth.highest, allow_video_fields=False,
-                            recv_name='VTO preview')
+        receiver = NativeReceiver(self.source['name'])
+        renderer_stop = threading.Event()
+        latest = dict(frame=None, sequence=0, error=None)
+
+        def render():
+            previous = 0
+            try:
+                while not self.stop.is_set() and not renderer_stop.is_set():
+                    with self.condition:
+                        self.condition.wait_for(lambda: latest['sequence'] != previous or self.stop.is_set() or renderer_stop.is_set(), timeout=.2)
+                        if self.stop.is_set() or renderer_stop.is_set():
+                            break
+                        if latest['sequence'] == previous:
+                            continue
+                        frame, previous = latest['frame'], latest['sequence']
+                    started = time.monotonic()
+                    preview = resize_preview(frame, self.profile)
+                    ok, encoded = cv2.imencode('.jpg', preview, [cv2.IMWRITE_JPEG_QUALITY, self.profile['jpeg_quality']])
+                    if ok:
+                        self.publish(encoded.tobytes(), preview.shape[1], preview.shape[0])
+                    self.stop.wait(max(0, 1 / self.profile['fps'] - (time.monotonic() - started)))
+            except Exception as exc:
+                latest['error'] = exc
+
+        renderer = threading.Thread(target=render, daemon=True)
+        renderer.start()
+        last_input = self.last_frame
         try:
-            video = VideoFrameSync()
-            receiver.frame_sync.set_video_frame(video)
             self.ndi_stage = 'verbinden'
-            source = self.source['ndi_source']
-            if not source.valid and not source.update():
-                raise NDIReceiveError('NDI_SOURCE_LOST', 'De NDI-bron is niet meer beschikbaar. Zoek opnieuw.')
-            receiver.set_source(source)
             while not self.stop.is_set():
                 self.ndi_connections = receiver.get_num_connections()
-                if time.monotonic() - self.last_frame > 15:
+                counters = self.metrics.poll_sdk(receiver)
+                if counters and counters['recent_drops']:
+                    recordings.discontinuity(self.id, 'Opname afgebroken: de NDI-ontvanger meldt verloren bronframes.')
+                if latest['error'] is not None:
+                    raise NDIReceiveError('NDI_PREVIEW', 'Het ontvangen NDI-beeld kan niet worden weergegeven.')
+                if time.monotonic() - last_input > 15:
                     if not self.ndi_connections:
                         raise NDIReceiveError('NDI_CONNECT_TIMEOUT', 'NDI-bron gevonden, maar de videoverbinding komt niet tot stand binnen 15 seconden.')
                     raise NDIReceiveError('NDI_VIDEO_TIMEOUT', 'De NDI-verbinding is actief, maar de bron levert binnen 15 seconden geen videoframe.')
-                if not self.ndi_connections:
-                    self.ndi_stage = 'verbinden'
-                    self.stop.wait(.1)
-                    continue
                 self.ndi_stage = 'beeld ontvangen'
-                receiver.frame_sync.capture_video()
-                self.ndi_stage = 'beeld omzetten'
-                frame = read_bgr(video)
-                if frame is not None:
-                    if frame.shape[1] > 1280:
-                        frame = cv2.resize(frame, (1280, round(frame.shape[0] * 1280 / frame.shape[1])))
-                    ok, encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                video = receiver.capture_video(100)
+                if video is None:
+                    continue
+                try:
+                    captured = time.monotonic()
+                    metadata = ndi_metadata(video)
+                    self.metrics.set_input(metadata)
+                    recordings.configure_native(self.id, metadata['fps'])
+                    self.ndi_stage = 'beeld omzetten'
+                    frame = read_bgr(video)
+                    if frame is None:
+                        continue
+                    last_input = captured
+                    # Full received resolution/cadence goes to the recording
+                    # buffer. Preview throttling never discards archive frames.
+                    ok, encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
                     if ok:
-                        self.publish(encoded.tobytes(), frame.shape[1], frame.shape[0])
-                self.stop.wait(1 / 15)
+                        recordings.push(self.id, encoded.tobytes(), frame.shape[1], frame.shape[0], captured)
+                    with self.condition:
+                        latest['frame'] = frame
+                        latest['sequence'] += 1
+                        self.condition.notify_all()
+                finally:
+                    receiver.free_video()
         finally:
-            receiver.disconnect()
+            renderer_stop.set()
+            with self.condition:
+                self.condition.notify_all()
+            renderer.join(timeout=2)
+            receiver.close()
 
     def close(self):
         self.stop.set()
@@ -297,7 +338,7 @@ class Preview:
         recordings.stop_source(self.id)
 
     def status(self):
-        extra = dict(error_code=self.error_code)
+        extra = dict(error_code=self.error_code, signal=self.metrics.snapshot(), quality=dict(self.profile))
         if self.source['kind'] == 'NDI':
             extra['ndi'] = dict(stage=self.ndi_stage, connections=self.ndi_connections)
         if self.state == 'live' and time.monotonic() - self.last_frame > 3:
@@ -385,16 +426,19 @@ def start_preview():
     source_id = data.get('source_id')
     if not isinstance(source_id, str):
         return jsonify(error='Selecteer een bron.'), 400
+    quality = data.get('quality', 'balanced')
+    if not isinstance(quality, str) or quality not in QUALITY_PROFILES:
+        return jsonify(error='Kies een geldige beeldkwaliteit.'), 400
     with sources_lock:
         source = sources.get(source_id)
     if source is None:
         return jsonify(error='Deze bron is niet meer beschikbaar. Zoek opnieuw.'), 404
     with control_lock:
-        if recordings.is_collecting():
-            raise RecordingError('De clip wordt opgenomen. Wacht met het wisselen van bron.')
+        if recordings.is_busy():
+            raise RecordingError('Wacht tot de huidige clip is opgeslagen voordat je van bron of beeldstand wisselt.')
         if current:
             current.close()
-        current = Preview(source)
+        current = Preview(source, quality)
         return jsonify(id=current.id)
 
 

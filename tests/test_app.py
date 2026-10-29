@@ -30,6 +30,11 @@ class ApiTests(unittest.TestCase):
         duplicate = self.client.post('/api/sources', json={'url': 'rtsp://user:secret@camera.local:554/live'})
         self.assertEqual(duplicate.json['source']['id'], result.json['source']['id'])
 
+    def test_invalid_quality_does_not_start_or_replace_a_receiver(self):
+        for quality in ['not-a-profile', [], None]:
+            response = self.client.post('/api/preview', json={'source_id': app.DEMO['id'], 'quality': quality})
+            self.assertEqual(response.status_code, 400)
+
     def test_unknown_preview(self):
         self.assertEqual(self.client.post('/api/preview', json={'source_id':'missing'}).status_code, 404)
         self.assertEqual(self.client.get('/api/preview/missing').status_code, 404)
